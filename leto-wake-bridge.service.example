@@ -1,0 +1,23 @@
+# Leto 唤醒桥。User 改成能把消息投进你运行时的那个用户：injector 以它的身份跑。
+# 没加 ProtectHome／PrivateTmp：injector 常在家目录下、要连 /tmp 里的 tmux 之类的套接字，加了就找不到。
+[Unit]
+Description=Leto 唤醒桥
+Wants=network-online.target
+After=network-online.target
+# 令牌作废、Agent 删了、地址填错这类持续失败：5 分钟内拉起 5 次还不行就停在 failed，不无限重试
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=replace-with-runtime-user
+EnvironmentFile=/etc/leto-wake-bridge.env
+ExecStart=/usr/bin/node /opt/leto-wake-bridge/bridge.mjs run
+# 断线、EOF、没心跳时桥退出非零码，10 秒后拉起重连
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
