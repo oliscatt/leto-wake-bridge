@@ -9,6 +9,8 @@
 // 一次 run 只连一条：断线、EOF、没心跳都退出非零码，交给 systemd 拉起重连，进程内不重连。
 // 零依赖，Node 22 直接跑 `node bridge.mjs check|run`；只用这一个文件，可以单独拷到运行机上。
 import { spawn } from "node:child_process";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { isAbsolute } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -94,16 +96,32 @@ export function inject(injector, wake, { env = process.env, timeoutMs = DELIVERY
   });
 }
 
-/** 调一个 Leto MCP 工具。Leto 的 /mcp 是无状态 Streamable HTTP、回 JSON，一个 tools/call 就够，不用 SDK。 */
-export async function callTool(config, name, args = {}) {
-  const response = await fetch(new URL("/mcp", config.base), { method: "POST", signal: AbortSignal.timeout(20_000),
-    headers: { Authorization: `Bearer ${config.token}`, "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }) });
-  if (!response.ok) throw new Error(`${name}：HTTP ${response.status}`);
-  const { result, error } = await response.json();
-  const text = result?.content?.find((item) => item.type === "text")?.text ?? "";
-  if (error || result?.isError) throw new Error(`${name}：${error?.message ?? text}`);
-  return text;
+/**
+ * 调一个 Leto MCP 工具。Leto 的 /mcp 是无状态 Streamable HTTP、回 JSON，一个 tools/call 就够，不用 SDK。
+ * 不用 fetch，每次单开一条 HTTP/1.1 连接：Node 26 的 fetch 默认走 HTTP/2，会和开着的唤醒流挤同一条连接，
+ * undici 8.4.1～8.7.0（实测 Node 26.3.1、26.4.0 自带的 8.5.0）上带 body 的请求排在长流后面一直发不出去，补查就超时（undici#5538 修）。
+ */
+export function callTool(config, name, args = {}) {
+  const url = new URL("/mcp", config.base);
+  const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } });
+  return new Promise((resolve, reject) => {
+    const request = (url.protocol === "http:" ? httpRequest : httpsRequest)(url, { method: "POST", agent: false,
+      headers: { Authorization: `Bearer ${config.token}`, "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream", "Content-Length": Buffer.byteLength(body) } }, (response) => {
+      let text = "";
+      response.setEncoding("utf8").on("data", (chunk) => { text += chunk; }).on("error", reject).on("end", () => {
+        try {
+          if (response.statusCode < 200 || response.statusCode >= 300) throw new Error(`${name}：HTTP ${response.statusCode}`);
+          const { result, error } = JSON.parse(text);
+          const content = result?.content?.find((item) => item.type === "text")?.text ?? "";
+          if (error || result?.isError) throw new Error(`${name}：${error?.message ?? content}`);
+          resolve(content);
+        } catch (error) { reject(error); }
+      });
+    });
+    const timer = setTimeout(() => request.destroy(new Error(`${name}：20 秒没回`)), 20_000);
+    request.on("close", () => clearTimeout(timer)).on("error", reject).end(body);
+  });
 }
 
 const beijing = (iso) => new Date(iso).toLocaleTimeString("zh-CN", { timeZone: "Asia/Shanghai", hour: "2-digit",
