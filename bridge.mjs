@@ -127,6 +127,9 @@ export function callTool(config, name, args = {}) {
 const beijing = (iso) => new Date(iso).toLocaleTimeString("zh-CN", { timeZone: "Asia/Shanghai", hour: "2-digit",
   minute: "2-digit", hour12: false });
 
+/** 唤醒带了 expires_at 且已经过了；没带（好友申请、朋友圈这类不是调用的）或认不出的一律当没过期 */
+export const expired = (iso, now = Date.now()) => typeof iso === "string" && Number.isFinite(Date.parse(iso)) && now >= Date.parse(iso);
+
 /** 补投的唤醒。调用编号那一行和 Leto 推的唤醒一字不差，按编号认调用的 injector 不用改。 */
 export function recoveryWake(item) {
   const tag = { blind_answer: "[Leto·盲答]", blind_guess: "[Leto·猜一轮]" }[item.kind] ?? "[Leto]";
@@ -157,8 +160,10 @@ export async function run(config, { log = console.log, deliver = inject, idleMs 
   if (!config.injector.executable) throw new Error("run 要先配 LETO_INJECTOR_EXECUTABLE");
   const seen = new Set();
   let queue = Promise.resolve();
-  const enqueue = (label, wake) => {
+  // 意见 460：injector 慢的时候队里会积压，排到时调用已经过期的（Leto 唤醒带的 expires_at 过了）不再投，叫醒了也回不了
+  const enqueue = (label, wake, expiresAt) => {
     queue = queue.then(async () => {
+      if (expired(expiresAt)) { log(`跳过 ${label}：排到时已经过期（北京时间 ${beijing(expiresAt)} 前有效）`); return; }
       for (let attempt = 1; attempt <= 2; attempt++) {
         try { await deliver(config.injector, wake); log(`已投递 ${label}`); return; }
         catch (error) { log(`投递失败 ${label}（第 ${attempt} 次）：${error.message}`); }
@@ -174,7 +179,7 @@ export async function run(config, { log = console.log, deliver = inject, idleMs 
     log(`补查 leto_list_pending：没交回 ${items.length} 个，补投 ${missed.length} 个`);
     for (const item of missed) {
       seen.add(item.invocation_id);
-      enqueue(`补投 ${item.invocation_id}`, recoveryWake(item));
+      enqueue(`补投 ${item.invocation_id}`, recoveryWake(item), item.expires_at);
     }
   }).catch((error) => log(`补查 leto_list_pending 失败：${error.message}`));
 
@@ -208,7 +213,7 @@ export async function run(config, { log = console.log, deliver = inject, idleMs 
       if (id && seen.has(id)) continue;
       if (id) seen.add(id);
       log(`收到 ${label}`); // 只记类型和编号，不记正文
-      enqueue(label, { reason: wake.reason, message: wake.message });
+      enqueue(label, { reason: wake.reason, message: wake.message }, wake.expires_at);
     }
     throw new Error(connected ? "唤醒流断开了（EOF）" : "唤醒流没等到 connected 就断了");
   } finally {
